@@ -31,6 +31,8 @@ type xaiPolicySnapshot struct {
 	ObservedAt        time.Time
 	QuotaFailTimes    []time.Time
 	LongWindowResetAt time.Time
+	// LongWindowRemaining 是 OAuth 周长窗剩余%（creditUsagePercent 换算）；未知为 nil。
+	LongWindowRemaining *int64
 }
 
 func loadXAIPolicy(store *state.Store, authIndex string) xaiPolicySnapshot {
@@ -39,17 +41,18 @@ func loadXAIPolicy(store *state.Store, authIndex string) xaiPolicySnapshot {
 		return xaiPolicySnapshot{}
 	}
 	return xaiPolicySnapshot{
-		PlanClass:         entry.PlanClass,
-		QuotaFailCount:    entry.QuotaFailCount,
-		FirstSuccessAt:    entry.FirstSuccessAt,
-		NextEligibleAt:    entry.NextEligibleAt,
-		XAIDepletedKind:   entry.XAIDepletedKind,
-		AuthInvalid:       entry.AuthInvalid,
-		Remaining:         entry.Remaining,
-		ResetAt:           entry.ResetAt,
-		ObservedAt:        entry.ObservedAt,
-		QuotaFailTimes:    entry.QuotaFailTimes,
-		LongWindowResetAt: entry.LongWindowResetAt,
+		PlanClass:           entry.PlanClass,
+		QuotaFailCount:      entry.QuotaFailCount,
+		FirstSuccessAt:      entry.FirstSuccessAt,
+		NextEligibleAt:      entry.NextEligibleAt,
+		XAIDepletedKind:     entry.XAIDepletedKind,
+		AuthInvalid:         entry.AuthInvalid,
+		Remaining:           entry.Remaining,
+		ResetAt:             entry.ResetAt,
+		ObservedAt:          entry.ObservedAt,
+		QuotaFailTimes:      entry.QuotaFailTimes,
+		LongWindowResetAt:   entry.LongWindowResetAt,
+		LongWindowRemaining: cloneInt64Ptr(entry.LongWindowRemaining),
 	}
 }
 
@@ -97,6 +100,10 @@ func applyXAISuccess(prev xaiPolicySnapshot, now time.Time) xaiPolicySnapshot {
 	next.QuotaFailTimes = nil // 成功调用立即清零
 	next.XAIDepletedKind = ""
 	next.Remaining = 1
+	// OAuth 周账单已给出真实剩余%：业务成功不得把它重置成 1。
+	if rem, ok := xaiKnownLongWindowRemaining(prev); ok && rem > 0 {
+		next.Remaining = rem
+	}
 	next.ObservedAt = now.UTC()
 	if next.FirstSuccessAt.IsZero() {
 		next.FirstSuccessAt = now.UTC()
@@ -149,23 +156,24 @@ func writeXAIPolicy(ctx context.Context, store *state.Store, authIndex string, s
 // writeXAIPolicyWithLongWindow 写入策略；preserveLongWindow=true 时 usage 路径保留旧周长窗。
 func writeXAIPolicyWithLongWindow(ctx context.Context, store *state.Store, authIndex string, snap xaiPolicySnapshot, source state.Source, nextProbeAt time.Time, preserveLongWindow bool) error {
 	return store.MarkProbeSuccess(ctx, state.ProbeSuccess{
-		AuthIndex:          authIndex,
-		Provider:           core.ProviderXAI,
-		ObservedAt:         snap.ObservedAt,
-		ResetAt:            snap.ResetAt,
-		Remaining:          snap.Remaining,
-		Source:             source,
-		NextProbeAt:        nextProbeAt,
-		AuthInvalid:        false,
-		PlanType:           xaiPlanTypeFromClass(snap.PlanClass),
-		PlanClass:          snap.PlanClass,
-		QuotaFailCount:     snap.QuotaFailCount,
-		FirstSuccessAt:     snap.FirstSuccessAt,
-		NextEligibleAt:     snap.NextEligibleAt,
-		XAIDepletedKind:    snap.XAIDepletedKind,
-		QuotaFailTimes:     snap.QuotaFailTimes,
-		LongWindowResetAt:  snap.LongWindowResetAt,
-		PreserveLongWindow: preserveLongWindow,
+		AuthIndex:           authIndex,
+		Provider:            core.ProviderXAI,
+		ObservedAt:          snap.ObservedAt,
+		ResetAt:             snap.ResetAt,
+		Remaining:           snap.Remaining,
+		Source:              source,
+		NextProbeAt:         nextProbeAt,
+		AuthInvalid:         false,
+		PlanType:            xaiPlanTypeFromClass(snap.PlanClass),
+		PlanClass:           snap.PlanClass,
+		QuotaFailCount:      snap.QuotaFailCount,
+		FirstSuccessAt:      snap.FirstSuccessAt,
+		NextEligibleAt:      snap.NextEligibleAt,
+		XAIDepletedKind:     snap.XAIDepletedKind,
+		QuotaFailTimes:      snap.QuotaFailTimes,
+		LongWindowResetAt:   snap.LongWindowResetAt,
+		LongWindowRemaining: cloneInt64Ptr(snap.LongWindowRemaining),
+		PreserveLongWindow:  preserveLongWindow,
 	})
 }
 
@@ -182,5 +190,14 @@ func writeXAIAuthInvalid(ctx context.Context, store *state.Store, authIndex stri
 		entry.NextEligibleAt = time.Time{}
 		entry.XAIDepletedKind = ""
 		entry.LongWindowResetAt = time.Time{}
+		entry.LongWindowRemaining = nil
 	})
+}
+
+// xaiKnownLongWindowRemaining 返回周长窗与剩余%同时已知时的剩余%。
+func xaiKnownLongWindowRemaining(snap xaiPolicySnapshot) (int, bool) {
+	if snap.LongWindowResetAt.IsZero() || snap.LongWindowRemaining == nil {
+		return 0, false
+	}
+	return int(*snap.LongWindowRemaining), true
 }

@@ -51,6 +51,23 @@ func recordXAIPlanResult(ctx context.Context, store *state.Store, plan xai.PlanR
 		snap.ObservedAt = now.UTC()
 	}
 
+	// 周长窗：本轮账单 seen → 以 plan 为准（nil 清陈旧）；未 seen → 保留旧值。
+	var longWindow *time.Time
+	if plan.LongWindowBillingSeen {
+		if plan.LongWindowResetAt != nil && !plan.LongWindowResetAt.IsZero() {
+			snap.LongWindowResetAt = plan.LongWindowResetAt.UTC()
+			snap.LongWindowRemaining = cloneInt64Ptr(plan.LongWindowRemaining)
+			t := snap.LongWindowResetAt
+			longWindow = &t
+		} else {
+			snap.LongWindowResetAt = time.Time{}
+			snap.LongWindowRemaining = nil
+		}
+	} else if !snap.LongWindowResetAt.IsZero() {
+		t := snap.LongWindowResetAt.UTC()
+		longWindow = &t
+	}
+
 	inCooldown := xaiInFreeCooldown(snap, now)
 	remaining := 1
 	var depletedKind string
@@ -82,24 +99,14 @@ func recordXAIPlanResult(ctx context.Context, store *state.Store, plan xai.PlanR
 		if depletedKind == string(xai.DepletedFree) && !inCooldown {
 			depletedKind = ""
 		}
+		// OAuth 周账单 creditUsagePercent 已知：剩余%以账单为准，替代占位值 1。
+		if rem, ok := xaiKnownLongWindowRemaining(snap); ok && depletedKind == "" {
+			remaining = rem
+		}
 	}
 	snap.Remaining = remaining
 	snap.XAIDepletedKind = depletedKind
 	snap.ResetAt = resetAt
-	// 周长窗：本轮账单 seen → 以 plan 为准（nil 清陈旧）；未 seen → 保留旧值。
-	var longWindow *time.Time
-	if plan.LongWindowBillingSeen {
-		if plan.LongWindowResetAt != nil && !plan.LongWindowResetAt.IsZero() {
-			snap.LongWindowResetAt = plan.LongWindowResetAt.UTC()
-			t := snap.LongWindowResetAt
-			longWindow = &t
-		} else {
-			snap.LongWindowResetAt = time.Time{}
-		}
-	} else if !snap.LongWindowResetAt.IsZero() {
-		t := snap.LongWindowResetAt.UTC()
-		longWindow = &t
-	}
 	nextProbeAt := now.Add(xaiPositiveProbeInterval)
 	if inCooldown && !resetAt.IsZero() {
 		nextProbeAt = resetAt
@@ -113,23 +120,24 @@ func recordXAIPlanResult(ctx context.Context, store *state.Store, plan xai.PlanR
 		planType = xaiPlanTypeFromClass(planClass)
 	}
 	return priority.ProbeEvidence{
-		Provider:          core.ProviderXAI,
-		AuthIndex:         plan.AuthIndex,
-		ObservedAt:        snap.ObservedAt,
-		ResetAt:           &resetAt,
-		Remaining:         &rem,
-		LongWindowResetAt: longWindow,
-		Windows:           plan.Windows,
-		Freshness:         core.FreshnessFresh,
-		ProbeStatus:       core.ProbeStatusReady,
-		Status:            priority.EvidenceStatusReady,
-		PlanType:          planType,
-		EvidenceFresh:     true,
-		XAIDepletedKind:   depletedKind,
-		QuotaKnown:        true,
-		XAIPlanClass:      planClass,
-		XAINextEligibleAt: nextEligible,
-		XAIQuotaFailCount: snap.QuotaFailCount,
+		Provider:            core.ProviderXAI,
+		AuthIndex:           plan.AuthIndex,
+		ObservedAt:          snap.ObservedAt,
+		ResetAt:             &resetAt,
+		Remaining:           &rem,
+		LongWindowResetAt:   longWindow,
+		LongWindowRemaining: xaiLongWindowRemainingEvidence(snap, longWindow),
+		Windows:             plan.Windows,
+		Freshness:           core.FreshnessFresh,
+		ProbeStatus:         core.ProbeStatusReady,
+		Status:              priority.EvidenceStatusReady,
+		PlanType:            planType,
+		EvidenceFresh:       true,
+		XAIDepletedKind:     depletedKind,
+		QuotaKnown:          true,
+		XAIPlanClass:        planClass,
+		XAINextEligibleAt:   nextEligible,
+		XAIQuotaFailCount:   snap.QuotaFailCount,
 	}, nil
 }
 
@@ -142,4 +150,12 @@ func xaiPlanTypeFromClass(class string) core.PlanType {
 	default:
 		return core.PlanTypeUnknown
 	}
+}
+
+// xaiLongWindowRemainingEvidence 仅在周长窗存在时回填配对的剩余%（与 LongWindowResetAt 配对）。
+func xaiLongWindowRemainingEvidence(snap xaiPolicySnapshot, longWindow *time.Time) *int64 {
+	if longWindow == nil {
+		return nil
+	}
+	return cloneInt64Ptr(snap.LongWindowRemaining)
 }

@@ -40,6 +40,8 @@ type PlanResult struct {
 	Windows    []core.QuotaWindow
 	// LongWindowResetAt 仅来自 OAuth 周账单 currentPeriod(type=weekly).end；monthly 不计。
 	LongWindowResetAt *time.Time
+	// LongWindowRemaining 是周长窗剩余%（来自 creditUsagePercent）；字段缺失时为 nil。
+	LongWindowRemaining *int64
 	// LongWindowBillingSeen 表示本轮已成功拿到可解析的 OAuth 周账单响应；
 	// true 且 LongWindowResetAt=nil 时，store 必须清掉陈旧长窗。
 	LongWindowBillingSeen bool
@@ -167,12 +169,17 @@ func (p Prober) FetchPlan(ctx context.Context, request PlanRequest) PlanResult {
 	}
 	// OAuth：查询官方 CLI chat-proxy 周账单；API key 路径不改。
 	if isOAuthAuthKind(request.AuthKind) {
-		longAt, seen := p.fetchOAuthWeeklyLongWindow(ctx, request)
+		weekly, seen := p.fetchOAuthWeeklyLongWindow(ctx, request)
 		result.LongWindowBillingSeen = seen
-		result.LongWindowResetAt = longAt
-		if longAt != nil && !longAt.IsZero() {
+		result.LongWindowResetAt = weekly.ResetAt
+		if longAt := weekly.ResetAt; longAt != nil && !longAt.IsZero() {
+			windowRemaining := int64(100)
+			if remaining, ok := weekly.RemainingPercent(); ok {
+				windowRemaining = remaining
+				result.LongWindowRemaining = &remaining
+			}
 			result.Windows = []core.QuotaWindow{
-				{Name: "weekly", Duration: 7 * 24 * time.Hour, Remaining: 100, ResetAt: *longAt},
+				{Name: "weekly", Duration: 7 * 24 * time.Hour, Remaining: windowRemaining, ResetAt: *longAt},
 			}
 		}
 	}
@@ -182,7 +189,7 @@ func (p Prober) FetchPlan(ctx context.Context, request PlanRequest) PlanResult {
 // fetchOAuthWeeklyLongWindow 通过宿主 HTTPDoRaw 查询官方周账单。
 // 成功拿到 2xx body 时 seen=true（即使无 weekly 也要清陈旧长窗）；网络/非 2xx 时 seen=false 保留旧值。
 // 绝不记录 Authorization 或原始 billing/token 正文。
-func (p Prober) fetchOAuthWeeklyLongWindow(ctx context.Context, request PlanRequest) (*time.Time, bool) {
+func (p Prober) fetchOAuthWeeklyLongWindow(ctx context.Context, request PlanRequest) (OAuthBillingWeekly, bool) {
 	headers := planHeaders(request)
 	if userID := strings.TrimSpace(request.UserID); userID != "" {
 		headers["x-userid"] = []string{userID}
@@ -194,14 +201,14 @@ func (p Prober) fetchOAuthWeeklyLongWindow(ctx context.Context, request PlanRequ
 		Headers:   headers,
 	})
 	if err != nil {
-		return nil, false
+		return OAuthBillingWeekly{}, false
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || len(resp.Body) == 0 {
-		return nil, false
+		return OAuthBillingWeekly{}, false
 	}
 	// 有可解析响应体：seen=true；解析失败/无 weekly → nil 长窗（调用方清陈旧）。
-	longAt, _ := ParseWeeklyLongWindowReset(resp.Body)
-	return longAt, true
+	weekly, _ := ParseOAuthBillingWeekly(resp.Body)
+	return weekly, true
 }
 
 // ClassifyPlan 从 settings/billing JSON 与 JWT tier 判定 free/paid。
